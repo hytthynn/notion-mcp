@@ -1,0 +1,22 @@
+# Local credentials and generated runtime (do not publish)
+/config/*.json
+!/config/config.example.json
+/config/*.yml
+/config/*.yaml
+/runtime/
+# Backward-compatible protection for old layouts
+/config.json
+/status.json
+/ngrok*.yml
+/ngrok*.yaml
+*.log
+.env
+.env.*
+!.env.example
+*.bak-*
+_review_*.py
+# Generated dependencies and bytecode
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/

@@ -1,0 +1,18 @@
+{
+  "access_mode": "full",
+  "port": 8888,
+  "api_key": "",
+  "secret_path": "",
+  "ngrok_bin": "",
+  "ngrok": {
+    "config_path": "config/ngrok.yml",
+    "domain": "",
+    "heartbeat_interval": "20s",
+    "heartbeat_tolerance": "60s"
+  },
+  "desktop_commander": {
+    "defaultShell": "cmd.exe",
+    "telemetryEnabled": false,
+    "allowedDirectories": []
+  }
+}

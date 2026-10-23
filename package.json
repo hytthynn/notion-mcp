@@ -1,0 +1,18 @@
+{
+  "name": "notion-pc-bridge-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "mcp-proxy": "6.7.19",
+    "@wonderwhy-er/desktop-commander": "0.2.52"
+  },
+  "overrides": {
+    "sharp": "0.35.5"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "python scripts/manage.py check"
+  }
+}
