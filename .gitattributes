@@ -1,0 +1,25 @@
+# Normalize text in the repository, then force the endings each consumer needs.
+# LF is the default regardless of core.autocrlf, so checkouts are deterministic.
+* text=auto eol=lf
+
+# Windows batch files MUST be CRLF: cmd.exe mis-parses LF-only files and runs
+# fragments of lines as separate commands ("'ecutionPolicy' is not recognized").
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Everything else stays LF (PowerShell, Python, Node and editors all accept it).
+*.ps1 text eol=lf
+*.py  text eol=lf
+*.json text eol=lf
+*.md  text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Binary assets must never be converted or diffed as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.exe binary
