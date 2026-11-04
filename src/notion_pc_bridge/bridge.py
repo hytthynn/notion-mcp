@@ -8,12 +8,8 @@ Chain:
       -> mcp-proxy  127.0.0.1:<port>  (streamable HTTP MCP) (loopback only)
       -> @wonderwhy-er/desktop-commander (stdio)            (shell + files, on this PC)
 
-Run from the project root:
-    python scripts/manage.py start     start and verify the bridge
-    python scripts/manage.py verify    check a running public endpoint
-    python scripts/manage.py stop      request supervisor shutdown
-
-Stdlib only. Windows-first, POSIX-tolerant.
+Entrypoint: scripts/manage.py (install | setup | start | stop | verify).
+Stdlib only. Windows, macOS and Linux.
 """
 from __future__ import annotations
 
@@ -36,6 +32,7 @@ from pathlib import Path
 
 from .paths import ROOT, CONFIG_FILE, STATUS_FILE, RUNTIME_DIR
 from .processes import ProcessJob, identity, same_process, recover_owned
+from .system import OS_NAME, default_shell, script, shell_fits
 DC_CONFIG = Path.home() / ".claude-server-commander" / "config.json"   # desktop-commander's REAL config
 NGROK_API = "http://127.0.0.1:4040/api/tunnels"
 
@@ -61,7 +58,7 @@ def atomic_write(path: Path, text: str) -> None:
 
 def load_config() -> dict:
     if not CONFIG_FILE.exists():
-        raise SystemExit("Нет config/config.json. Сначала запустите setup_notion.bat.")
+        raise SystemExit(f"Нет config/config.json. Сначала запустите {script('setup_notion')}.")
     try:
         cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
         if not isinstance(cfg, dict):
@@ -71,7 +68,7 @@ def load_config() -> dict:
             raise ValueError("port должен быть целым числом от 1 до 65535")
         key = cfg.get("api_key", "")
         if not isinstance(key, str) or len(key) < 32 or not key.isascii() or any(c.isspace() for c in key):
-            raise ValueError("требуется надёжный ASCII-ключ api_key; запустите setup_notion.bat")
+            raise ValueError(f"требуется надёжный ASCII-ключ api_key; запустите {script('setup_notion')}")
         if cfg.get("require_api_key", True) is not True:
             raise ValueError("отключение авторизации по API-ключу не поддерживается")
         if cfg.get("stateless", True) is not True:
@@ -84,7 +81,11 @@ def load_config() -> dict:
             if not isinstance(cfg[name], dict):
                 raise ValueError(f"{name} должен быть JSON-объектом")
         dc = cfg["desktop_commander"]
-        dc.setdefault("defaultShell", "cmd.exe")
+        if dc.get("defaultShell") is not None and not isinstance(dc["defaultShell"], str):
+            raise ValueError("desktop_commander.defaultShell должен быть строкой с командой оболочки")
+        if not shell_fits(dc.get("defaultShell")):
+            # Empty or from another OS (e.g. a Windows config copied to Linux).
+            dc["defaultShell"] = default_shell()
         dc.setdefault("telemetryEnabled", False)
         # Explicitly selected full-PC mode. Empty list is DC's unrestricted mode.
         if cfg.get("access_mode", "full") != "full":
@@ -94,8 +95,6 @@ def load_config() -> dict:
         for name in ("ngrok_bin", "mcp_proxy_js", "desktop_commander_js"):
             if name in cfg and not isinstance(cfg[name], str):
                 raise ValueError(f"{name} должен быть строкой с путём")
-        if not isinstance(dc.get("defaultShell"), str) or not dc["defaultShell"].strip():
-            raise ValueError("desktop_commander.defaultShell должен быть строкой с командой оболочки")
         if type(dc.get("telemetryEnabled")) is not bool:
             raise ValueError("desktop_commander.telemetryEnabled должен быть true или false")
         if "blockedCommands" in dc and (not isinstance(dc["blockedCommands"], list)
@@ -132,7 +131,7 @@ def resolve(cfg: dict, key: str, subpath: str) -> str:
     local = ROOT / "node_modules" / subpath
     if local.exists():
         return str(local)
-    raise SystemExit(f"Отсутствует локальная зависимость {subpath}. Запустите install_dependencies.bat.")
+    raise SystemExit(f"Отсутствует локальная зависимость {subpath}. Запустите {script('install_dependencies')}.")
 
 
 def find_ngrok(cfg: dict) -> str:
@@ -148,7 +147,7 @@ def find_ngrok(cfg: dict) -> str:
     found = ngrok_path()
     if found:
         return found
-    raise SystemExit("ngrok не найден. Запустите install_dependencies.bat.")
+    raise SystemExit(f"ngrok не найден. Запустите {script('install_dependencies')}.")
 
 
 # ── desktop-commander config ────────────────────────────────────────────────
@@ -197,12 +196,10 @@ def start_proxy(cfg: dict) -> subprocess.Popen:
     node = shutil.which("node") or "node"
     proxy_js = resolve(cfg, "mcp_proxy_js", "mcp-proxy/dist/bin/mcp-proxy.mjs")
     dc_js = resolve(cfg, "desktop_commander_js", "@wonderwhy-er/desktop-commander/dist/index.js")
-    secret = cfg["secret_path"]
     args = [node, proxy_js,
             "--host", "127.0.0.1",            # loopback only: ngrok is the sole ingress
             "--port", str(cfg["port"]),
             "--server", "stream",              # no /sse endpoint to leave unauthenticated
-            "--streamEndpoint", f"/{secret}",  # additional secret path; X-API-Key remains required
             "--corsAddAllowedHeader", "X-API-Key"]
     if cfg.get("stateless", True):
         # Stateless streamable HTTP: no Mcp-Session-Id, no persistent SSE stream per
@@ -211,11 +208,18 @@ def start_proxy(cfg: dict) -> subprocess.Popen:
         # they piled up until the free ngrok tier started dropping connections
         # (client-side RemoteDisconnected). Stateless removes the accumulation.
         args += ["--stateless"]
-    if cfg.get("api_key"):
-        args += ["--apiKey", cfg["api_key"]]
     args += ["--", node, dc_js]
-    with (RUNTIME_DIR / "bridge.log").open("ab", buffering=0) as log:
-        return subprocess.Popen(args, cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
+    log_path = RUNTIME_DIR / "bridge.log"
+    if log_path.exists() and log_path.stat().st_size > 5 * 1024 * 1024:
+        os.replace(log_path, log_path.with_name("bridge.log.1"))   # keep one previous log
+    # The API key and secret path go through mcp-proxy's MCP_PROXY_* environment
+    # options, not argv: command lines are visible to every local account on
+    # macOS/Linux. Stray MCP_PROXY_* variables from the user's shell are dropped.
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MCP_PROXY_")}
+    env["MCP_PROXY_STREAM_ENDPOINT"] = f"/{cfg['secret_path']}"  # secret path; X-API-Key remains required
+    env["MCP_PROXY_API_KEY"] = cfg["api_key"]
+    with log_path.open("ab", buffering=0) as log:
+        return subprocess.Popen(args, cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT, env=env,
                                 creationflags=NO_WINDOW, start_new_session=os.name != "nt")
 
 
@@ -255,7 +259,7 @@ def start_ngrok(cfg: dict) -> subprocess.Popen:
         token, domain = token or yml_token, domain or yml_domain
     token = token or os.environ.get("NGROK_AUTHTOKEN", "")
     if not token:
-        sys.exit("Не задан токен ngrok. Запустите setup_notion.bat или задайте NGROK_AUTHTOKEN.")
+        raise SystemExit(f"Не задан токен ngrok. Запустите {script('setup_notion')} или задайте NGROK_AUTHTOKEN.")
     if not re.fullmatch(r"[A-Za-z0-9_-]+", token):
         raise SystemExit("Неверный формат токена ngrok.")
     # Explicit 127.0.0.1, NOT a bare port: a bare port makes ngrok dial
@@ -266,22 +270,52 @@ def start_ngrok(cfg: dict) -> subprocess.Popen:
     # default tolerance a short outbound hiccup terminates the session ("heartbeat timeout,
     # terminating session") and every in-flight request dies with RemoteDisconnected while
     # it reconnects. Observed live; 60s tolerance absorbs it.
-    ng = cfg["ngrok"]
-    lines = ['version: "3"', "agent:"]
-    if token:
-        lines.append(f"  authtoken: {token}")
+    lines = ['version: "3"', "agent:", f"  authtoken: {token}"]
     lines += [f"  heartbeat_interval: {ng.get('heartbeat_interval', '20s')}",
               f"  heartbeat_tolerance: {ng.get('heartbeat_tolerance', '60s')}",
               "  log: stdout", "  log_format: json"]
     agent_cfg = RUNTIME_DIR / "ngrok-agent.yml"     # contains the authtoken -> gitignored (deny-all)
     atomic_write(agent_cfg, "\n".join(lines) + "\n")
-    args = [ngrok, "http", f"127.0.0.1:{cfg['port']}", "--config", str(agent_cfg),
-            "--host-header", f"127.0.0.1:{cfg['port']}"]
+    # --inspect=false: the local inspector (127.0.0.1:4040) would otherwise keep
+    # every request, X-API-Key header included, readable by any local account.
+    args = [ngrok, "http", f"127.0.0.1:{cfg['port']}", "--config", str(agent_cfg), "--inspect=false"]
     if domain:
-        args += ["--domain", domain]
+        args += ["--url", f"https://{domain}"]
     with (RUNTIME_DIR / "ngrok.log").open("wb", buffering=0) as log:
         return subprocess.Popen(args, cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
                                 creationflags=NO_WINDOW, start_new_session=os.name != "nt")
+
+
+NGROK_HINTS = {
+    "ERR_NGROK_105": "токен ngrok неверный — повторите {setup}",
+    "ERR_NGROK_107": "токен ngrok недействителен или сброшен — повторите {setup}",
+    "ERR_NGROK_108": "достигнут лимит сессий ngrok — закройте другие запущенные ngrok",
+    "ERR_NGROK_120": "версия ngrok устарела — запустите {install}",
+    "ERR_NGROK_121": "версия ngrok устарела — запустите {install}",
+    "ERR_NGROK_313": "домен не принадлежит вашему аккаунту ngrok — проверьте его в {setup}",
+    "ERR_NGROK_320": "домен не принадлежит вашему аккаунту ngrok — проверьте его в {setup}",
+    "ERR_NGROK_334": "этот домен уже занят другим запущенным ngrok — остановите его",
+}
+
+
+def ngrok_error(log_path: Path) -> str:
+    """First fatal ngrok error from its JSON log, shortened, with a hint."""
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        err = str(entry.get("err", "")) if isinstance(entry, dict) and entry.get("lvl") in ("eror", "crit") else ""
+        code = re.search(r"ERR_NGROK_\d+", err)
+        if code:
+            hint = NGROK_HINTS.get(code.group(0), "подробности — в runtime/ngrok.log")
+            hint = hint.format(setup=script("setup_notion"), install=script("install_dependencies"))
+            return f"{err.strip().splitlines()[0][:200]} ({code.group(0)}): {hint}"
+    return ""
 
 
 def public_url(cfg: dict, deadline_s: int = 45) -> str:
@@ -291,6 +325,9 @@ def public_url(cfg: dict, deadline_s: int = 45) -> str:
     while time.monotonic() < end:
         if STOP_FILE.exists():
             return ""
+        error = ngrok_error(log_path)
+        if error:
+            raise SystemExit("ngrok: " + error)
         try:
             with urllib.request.urlopen(NGROK_API, timeout=5) as r:
                 tunnels = json.loads(r.read().decode()).get("tunnels", [])
@@ -438,18 +475,19 @@ def write_status(cfg: dict, url: str, proxy=None, tunnel=None, state="up") -> No
     }, indent=2) + "\n")
 
 
-def terminate_tree(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
+def terminate_tree(proc: subprocess.Popen, sig: int = signal.SIGTERM) -> None:
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       creationflags=NO_WINDOW)
-    else:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        if proc.poll() is None:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=NO_WINDOW)
+        return
+    # Each child leads its own process group (start_new_session). Signal the whole
+    # group even when the leader is gone, so Desktop Commander never outlives it.
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 STOP_FILE = RUNTIME_DIR / "stop.request"
@@ -524,7 +562,7 @@ def start_or_show(args):
             print(f"Локальный порт: {status.get('port')}", flush=True)
             banner(status["mcp_url"], load_config())
         else:
-            print("Дождитесь готовности в первом окне. Для остановки используйте stop_notion.bat из этой же папки.", flush=True)
+            print(f"Дождитесь готовности в первом окне. Для остановки используйте {script('stop_notion')} из этой же папки.", flush=True)
         return 0
 
 
@@ -560,16 +598,20 @@ class InstanceLock:
 
 
 def cleanup_processes(*processes):
+    processes = [proc for proc in processes if proc is not None]
     for proc in processes:
-        if proc is not None:
-            terminate_tree(proc)
+        terminate_tree(proc)
     for proc in processes:
-        if proc is not None:
-            try:
-                proc.wait(timeout=8)
-            except subprocess.TimeoutExpired:
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            if os.name == "nt":
                 proc.kill()
-                proc.wait(timeout=8)
+            else:
+                terminate_tree(proc, signal.SIGKILL)
+            proc.wait(timeout=8)
+        if os.name != "nt":
+            terminate_tree(proc, signal.SIGKILL)   # stragglers left in the group
 
 
 def banner(url: str, cfg: dict) -> None:
@@ -580,9 +622,9 @@ def banner(url: str, cfg: dict) -> None:
     print(f"URL: {url}", flush=True)
     print(f"X-Api-Key: {cfg['api_key']}", flush=True)
     print("Транспорт: Streamable HTTP", flush=True)
-    print("Доступ: ВЕСЬ ПК (в пределах прав вашей учётной записи Windows)", flush=True)
+    print(f"Доступ: ВЕСЬ КОМПЬЮТЕР (в пределах прав вашей учётной записи {OS_NAME})", flush=True)
     print("ВНИМАНИЕ: обладатель URL и ключа получит доступ к вашим файлам и терминалу.", flush=True)
-    print("Не показывайте эту консоль другим. Для остановки: Ctrl+C или stop_notion.bat.\n", flush=True)
+    print(f"Не показывайте эту консоль другим. Для остановки: Ctrl+C или {script('stop_notion')}.\n", flush=True)
 
 
 def select_port(preferred, attempts=32):
@@ -601,9 +643,18 @@ def select_port(preferred, attempts=32):
         return probe.getsockname()[1]
 
 
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def run(args) -> int:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     cfg = load_config()
+    if os.name != "nt":
+        # Closing the terminal (SIGHUP) or `kill` (SIGTERM) must still run the cleanup
+        # below: children live in their own sessions and would otherwise survive.
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, _interrupt)
     if not args.print_url:
         print("Статус: ЗАПУСК", flush=True)
     STOP_FILE.unlink(missing_ok=True)
@@ -696,9 +747,15 @@ def run(args) -> int:
         detail = f"; код Windows/ОС: {code}" if code is not None else ""
         raise OSError(f"Этап: {stage}{detail}. {exc}") from exc
     except KeyboardInterrupt:
-        print("\n[мост] Останавливаем…")
+        try:
+            print("\n[мост] Останавливаем…", flush=True)
+        except OSError:
+            pass
         return 0
     finally:
+        if os.name != "nt":
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                signal.signal(sig, signal.SIG_IGN)   # a second Ctrl+C must not abort cleanup
         # Closing the Job also removes descendants when a root already exited.
         try:
             cleanup_processes(tunnel, proxy)
@@ -707,5 +764,9 @@ def run(args) -> int:
                 owned_job.close()
             STATUS_FILE.unlink(missing_ok=True)
             STOP_FILE.unlink(missing_ok=True)
+            (RUNTIME_DIR / "ngrok-agent.yml").unlink(missing_ok=True)   # holds the authtoken
         if not args.print_url:
-            print("Статус: ОСТАНОВЛЕН", flush=True)
+            try:
+                print("Статус: ОСТАНОВЛЕН", flush=True)
+            except OSError:
+                pass   # the terminal may already be closed

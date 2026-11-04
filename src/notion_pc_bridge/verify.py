@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """Re-verify an already-running bridge without restarting it.
 
-Reads status.json, then walks the MCP handshake (initialize -> tools/list)
+Reads runtime/status.json, then walks the MCP handshake (initialize -> tools/list)
 over the PUBLIC ngrok URL and prints the exposed tool names.
 
-Usage: python verify_bridge.py
+Usage: python scripts/manage.py verify [--prove]
 Exit:  0 = the cloud agent can reach and list tools, 1 = it cannot.
 """
 from __future__ import annotations
 
 import json
-from .cli import RussianParser
 import re
 import time
-from pathlib import Path
 
 from . import bridge
-from .paths import STATUS_FILE as STATUS, CONFIG_FILE as CONFIG
-
+from .cli import RussianParser
+from .paths import STATUS_FILE as STATUS
+from .system import script
 
 
 def prove_tools(url: str, cfg: dict, sid: str | None) -> bool:
@@ -83,17 +82,17 @@ def prove_tools(url: str, cfg: dict, sid: str | None) -> bool:
         print(f"[диагностика] Ошибка get_config → {out[:300]}")
         ok = False
     # Full-access mode: do not claim a folder sandbox exists or probe private files.
-    print("[диагностика] Полный доступ к ПК: ограничений по папкам нет.")
+    print("[диагностика] Полный доступ к компьютеру: ограничений по папкам нет.")
     marker = "BRIDGE-SHELL-OK"
     good, out = call_tool(5, "start_process",
                           {"command": f"echo {marker} && hostname", "timeout_ms": 20000})
     ran = good is True and marker in out
-    print(f"[диагностика] Команда оболочки → {'ГОТОВО, выполнена на этом ПК' if ran else 'ОШИБКА: ' + out[:200]}")
+    print(f"[диагностика] Команда оболочки → {'ГОТОВО, выполнена на этом компьютере' if ran else 'ОШИБКА: ' + out[:200]}")
     if not ran:
         ok = False
-    sess = re.search(r'"sessionId":\s*"([^"]+)"', out)
-    if sess:                                     # best-effort cleanup of the spawned shell
-        call_tool(6, "force_terminate", {"sessionId": sess.group(1)})
+    pid = re.search(r"\bPID (\d+)", out)
+    if pid:                                      # best-effort cleanup of the spawned shell
+        call_tool(6, "force_terminate", {"pid": int(pid.group(1))})
     return ok
 
 
@@ -102,7 +101,7 @@ def main() -> int:
     parser.add_argument("--prove", action="store_true", help="также проверить конфигурацию файлового доступа и безопасную команду оболочки")
     args = parser.parse_args()
     if not STATUS.exists():
-        print("Нет runtime/status.json — мост не запущен. Запустите start_notion.bat.")
+        print(f"Нет runtime/status.json — мост не запущен. Запустите {script('start_notion')}.")
         return 1
     status = json.loads(STATUS.read_text(encoding="utf-8"))
     cfg = bridge.load_config()

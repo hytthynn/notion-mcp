@@ -7,6 +7,9 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 
+# Shell scripts MUST be LF: bash on macOS/Linux fails on "\r" ("bad interpreter").
+*.sh text eol=lf
+
 # Everything else stays LF (PowerShell, Python, Node and editors all accept it).
 *.ps1 text eol=lf
 *.py  text eol=lf

@@ -11,7 +11,7 @@
     "heartbeat_tolerance": "60s"
   },
   "desktop_commander": {
-    "defaultShell": "cmd.exe",
+    "defaultShell": "",
     "telemetryEnabled": false,
     "allowedDirectories": []
   }

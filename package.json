@@ -11,8 +11,5 @@
   },
   "engines": {
     "node": ">=22"
-  },
-  "scripts": {
-    "check": "python scripts/manage.py check"
   }
 }

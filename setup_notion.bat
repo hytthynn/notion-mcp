@@ -8,4 +8,8 @@ color 0F
 title MCP-мост для Notion — Настройка
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\bootstrap.ps1" -Action setup
 set "result=%errorlevel%"
+if /I not "%MCP_NO_PAUSE%"=="1" (
+  echo    Нажмите любую клавишу, чтобы закрыть окно…
+  pause >nul
+)
 exit /b %result%

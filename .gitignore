@@ -4,12 +4,14 @@
 /config/*.yml
 /config/*.yaml
 /runtime/
+/tools/
 # Backward-compatible protection for old layouts
 /config.json
 /status.json
 /ngrok*.yml
 /ngrok*.yaml
 *.log
+*.log.1
 .env
 .env.*
 !.env.example

@@ -15,6 +15,8 @@ def main():
     parser.add_argument('--prove', action='store_true', help='проверить настройки файлового доступа и выполнить безопасную команду оболочки')
     args = parser.parse_args()
     from notion_pc_bridge import bridge, configure, dependencies, verify
+    from notion_pc_bridge.system import add_local_tools_to_path
+    add_local_tools_to_path()
     if args.action == 'install':
         dependencies.clear_receipt()
         if not dependencies.ensure_all(interactive=True):

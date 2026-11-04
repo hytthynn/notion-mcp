@@ -1,11 +1,19 @@
-"""Владение процессами Windows: Job Object и защита от повторного использования PID."""
+"""Владение процессами: Job Object в Windows, группы процессов в macOS/Linux.
+
+Процесс опознаётся по PID + времени запуска + исполняемому файлу, поэтому
+повторно выданный системой PID никогда не будет принят за свой.
+"""
 from __future__ import annotations
 import ctypes
-from ctypes import wintypes
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
+import time
+
+if os.name == 'nt':
+    from ctypes import wintypes
 
 
 def _api():
@@ -39,9 +47,39 @@ def _identity(dll, handle, pid):
     return {'pid': int(pid), 'created': str(created), 'image': os.path.normcase(name.value)}
 
 
-def identity(pid):
-    if os.name != 'nt' or type(pid) is not int or pid <= 0:
+def _posix_identity(pid):
+    """Linux: время запуска из /proc; macOS: из ps. Зомби считаются завершёнными."""
+    proc = Path('/proc')/str(pid)
+    if Path('/proc/self/stat').exists():
+        try:
+            stat = (proc/'stat').read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            return None
+        fields = stat[stat.rindex(')')+2:].split()
+        if len(fields) < 20 or fields[0] in ('Z', 'X'):
+            return None
+        try:
+            image = os.readlink(proc/'exe')
+        except OSError:
+            image = ''
+        return {'pid': int(pid), 'created': fields[19], 'image': image}
+    try:
+        result = subprocess.run(['ps', '-o', 'stat=', '-o', 'lstart=', '-o', 'comm=', '-p', str(pid)],
+                                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                                env={**os.environ, 'LC_ALL': 'C'}, timeout=10)
+    except (OSError, subprocess.SubprocessError):
         return None
+    parts = result.stdout.strip().split(None, 6)
+    if result.returncode or len(parts) < 7 or parts[0].startswith('Z'):
+        return None
+    return {'pid': int(pid), 'created': ' '.join(parts[1:6]), 'image': parts[6]}
+
+
+def identity(pid):
+    if type(pid) is not int or pid <= 0:
+        return None
+    if os.name != 'nt':
+        return _posix_identity(pid)
     dll = _api()
     handle = dll.OpenProcess(0x1000 | 0x00100000, False, pid)
     if not handle:
@@ -59,10 +97,35 @@ def same_process(record):
     return current is not None and current == record
 
 
+def _posix_terminate(record):
+    """SIGTERM всей группе (прокси + Desktop Commander), через 5 с — SIGKILL."""
+    pid = record['pid']
+    if _posix_identity(pid) != record:
+        return False
+    try:
+        group = os.getpgid(pid) == pid
+    except ProcessLookupError:
+        return True
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pid, sig) if group else os.kill(pid, sig)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        for _ in range(50):
+            if _posix_identity(pid) != record:
+                return True
+            time.sleep(0.1)
+    return _posix_identity(pid) != record
+
+
 def terminate_exact(record):
     """Verify birth time and executable on the SAME handle used to terminate."""
-    if os.name != 'nt' or not isinstance(record, dict) or type(record.get('pid')) is not int:
+    if not isinstance(record, dict) or type(record.get('pid')) is not int:
         return False
+    if os.name != 'nt':
+        return _posix_terminate(record)
     dll = _api()
     handle = dll.OpenProcess(0x1000 | 0x0001 | 0x00100000, False, record['pid'])
     if not handle:
@@ -85,7 +148,7 @@ def find_owned(root):
     native handle before a process can be terminated.
     """
     if os.name != 'nt':
-        return []
+        return _posix_find_owned(root)
     root = str(Path(root).resolve()).replace('/', '\\').lower().rstrip('\\')
     proxy = (root+'\\node_modules\\mcp-proxy\\dist\\bin\\mcp-proxy.mjs').replace("'", "''")
     commander = (root+'\\node_modules\\@wonderwhy-er\\desktop-commander\\dist\\index.js').replace("'", "''")
@@ -110,17 +173,47 @@ Get-CimInstance Win32_Process -Filter \"Name='node.exe' OR Name='ngrok.exe'\" | 
         raise RuntimeError('Не удалось безопасно проверить оставшиеся процессы этой папки.') from exc
 
 
+def _posix_find_owned(root):
+    """Сироты прошлого запуска (например, после kill -9) по точным путям этой папки."""
+    root = Path(root).resolve()
+    proxy = str(root/'node_modules'/'mcp-proxy'/'dist'/'bin'/'mcp-proxy.mjs')
+    commander = str(root/'node_modules'/'@wonderwhy-er'/'desktop-commander'/'dist'/'index.js')
+    agent = str(root/'runtime'/'ngrok-agent.yml')
+    try:
+        result = subprocess.run(['ps', '-A', '-ww', '-o', 'pid=', '-o', 'args='], capture_output=True,
+                                text=True, encoding='utf-8', errors='replace', timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    records = []
+    for line in result.stdout.splitlines():
+        pid_text, _, args = line.strip().partition(' ')
+        if not pid_text.isdigit() or int(pid_text) == os.getpid():
+            continue
+        role = ('proxy' if proxy in args and commander in args else 'ngrok' if agent in args
+                else 'commander' if commander in args else '')
+        current = _posix_identity(int(pid_text)) if role else None
+        name = Path(current['image']).name.lower() if current else ''
+        if current and (('ngrok' in name) if role == 'ngrok' else ('node' in name)):
+            records.append({**current, 'role': role})
+    return records
+
+
 def recover_owned(root):
     count = 0
     records = find_owned(root)
     # Removing the tunnel first prevents new remote requests during recovery.
-    for item in sorted(records, key=lambda record: record['role'] != 'ngrok'):
+    order = {'ngrok': 0, 'proxy': 1, 'commander': 2}
+    for item in sorted(records, key=lambda record: order.get(record['role'], 3)):
         observed = {key: item[key] for key in ('pid', 'created', 'image')}
         current = identity(observed['pid'])
         # CIM truncates FILETIME to microseconds. Re-check exact native birth time
         # on the termination handle after matching this discovery snapshot.
-        if current and (current['image'] == observed['image']
-                        and int(current['created'])//10 == int(observed['created'])//10):
+        if os.name != 'nt':
+            matches = current == observed
+        else:
+            matches = bool(current) and (current['image'] == observed['image']
+                                         and int(current['created'])//10 == int(observed['created'])//10)
+        if matches:
             if terminate_exact(current):
                 count += 1
             elif same_process(current):

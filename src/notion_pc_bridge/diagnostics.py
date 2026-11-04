@@ -6,6 +6,7 @@ import sys
 import traceback
 
 from .paths import CONFIG_FILE, RUNTIME_DIR
+from .system import script
 
 
 def redact(text):
@@ -24,7 +25,7 @@ def redact(text):
 def report_error(exc):
     message = redact(str(exc))
     print(f'Статус: ОШИБКА ({type(exc).__name__}) — {message}', file=sys.stderr)
-    print('Подробности: runtime/launcher.log. Для проблем с компонентами запустите install_dependencies.bat.', file=sys.stderr)
+    print(f"Подробности: runtime/launcher.log. Для проблем с компонентами запустите {script('install_dependencies')}.", file=sys.stderr)
     try:
         RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
         with (RUNTIME_DIR/'launcher.log').open('a', encoding='utf-8') as log:

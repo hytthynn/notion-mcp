@@ -1,7 +1,12 @@
-"""Dependency inspection and opt-in installation. Never starts MCP or a tunnel."""
+"""Dependency inspection and opt-in installation. Never starts MCP or a tunnel.
+
+Windows installs through winget. macOS and Linux download the official Node.js
+and ngrok builds into tools/ of this folder: no sudo, no system changes.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,8 +14,13 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
+import urllib.request
+import zipfile
 
-from .paths import ROOT, CONFIG_FILE
+from .paths import ROOT, CONFIG_FILE, TOOLS_DIR
+from .system import IS_WINDOWS, IS_MAC, add_local_tools_to_path, machine, script
 
 
 @dataclass
@@ -31,7 +41,7 @@ def version(text):
 
 
 def executable(name):
-    return shutil.which(name+'.cmd') or shutil.which(name)
+    return (shutil.which(name+'.cmd') if IS_WINDOWS else None) or shutil.which(name)
 
 
 NGROK_MINIMUM = (3, 39, 0)
@@ -59,17 +69,25 @@ def ngrok_candidates():
     def add(path):
         if isinstance(path, (str, os.PathLike)) and path:
             candidate = Path(path)
-            if candidate.is_file() and os.path.normcase(str(candidate)) not in seen:
+            if (candidate.is_file() and (IS_WINDOWS or os.access(candidate, os.X_OK))
+                    and os.path.normcase(str(candidate)) not in seen):
                 candidates.append(str(candidate))
                 seen.add(os.path.normcase(str(candidate)))
     seen = set()
     receipt = read_receipt() or {}
     add(receipt.get('ngrok_binary'))
     add(executable('ngrok'))
+    names = ('ngrok.exe', 'ngrok.cmd', 'ngrok.bat', 'ngrok') if IS_WINDOWS else ('ngrok',)
     for directory in os.environ.get('PATH', '').split(os.pathsep):
         if directory:
-            for name in ('ngrok.exe', 'ngrok.cmd', 'ngrok.bat', 'ngrok'):
+            for name in names:
                 add(Path(os.path.expandvars(directory.strip('"')))/name)
+    if not IS_WINDOWS:
+        add(TOOLS_DIR/'ngrok')
+        home = Path.home()
+        for directory in ('/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/snap/bin', home/'.local/bin', home/'bin'):
+            add(Path(directory)/'ngrok')
+        return candidates
     local = os.environ.get('LOCALAPPDATA')
     if local:
         add(Path(local)/'Microsoft/WindowsApps/ngrok.exe')
@@ -129,7 +147,7 @@ def update_ngrok_after_winget():
     status = inspect_ngrok()
     if status.ok:
         return
-    print('[ngrok] После winget: '+status.detail, flush=True)
+    print('[ngrok] После установки: '+status.detail, flush=True)
     if _LAST_NGROK and confirm('Обновить этот ngrok встроенной командой «ngrok update»? Файл: '+_LAST_NGROK):
         try:
             result = subprocess.run([_LAST_NGROK, 'update'], cwd=str(ROOT), timeout=180)
@@ -201,7 +219,7 @@ def display(checks):
     print('\n=== Проверка зависимостей ===', flush=True)
     for item in checks:
         print(f"[{'ГОТОВО' if item.ok else 'НЕТ/ОШИБКА'}] {item.name}: {item.detail}", flush=True)
-    print('Учётная запись и токен ngrok настраиваются отдельно через setup_notion.bat.', flush=True)
+    print(f"Учётная запись и токен ngrok настраиваются отдельно через {script('setup_notion')}.", flush=True)
 
 
 def confirm(message):
@@ -213,7 +231,8 @@ def confirm(message):
 
 def refresh_path():
     """Installers update registry PATH, not this Python process's environment."""
-    if os.name != 'nt':
+    if not IS_WINDOWS:
+        add_local_tools_to_path()
         return
     import winreg
     values = []
@@ -238,27 +257,122 @@ def install_winget(package_id):
     return result.returncode == 0
 
 
+# ── macOS/Linux: official builds into tools/ ─────────────────────────────────
+NODE_DIST = 'https://nodejs.org/dist'
+NGROK_DIST = 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-{system}-{arch}.{ext}'
+
+
+def download(url, target):
+    """urllib first; curl as a fallback for Python builds without CA certificates."""
+    try:
+        request = urllib.request.Request(url, headers={'User-Agent': 'notion-pc-bridge'})
+        with urllib.request.urlopen(request, timeout=60) as response, open(target, 'wb') as stream:
+            shutil.copyfileobj(response, stream)
+        return
+    except OSError:
+        curl = shutil.which('curl')
+        if not curl:
+            raise
+    subprocess.run([curl, '-fsSL', '--retry', '2', '-o', str(target), url], check=True, timeout=900)
+
+
+def install_node_local():
+    """Newest Node.js LTS from nodejs.org, SHA-256 verified, into tools/node."""
+    arch = {'x64': 'x64', 'arm64': 'arm64', 'arm': 'armv7l'}.get(machine())
+    system = 'darwin' if IS_MAC else 'linux'
+    if not arch or (IS_MAC and arch == 'armv7l'):
+        raise OSError(f'нет официальной сборки Node.js для архитектуры {machine()}')
+    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=TOOLS_DIR) as temp:
+        temp = Path(temp)
+        download(f'{NODE_DIST}/index.json', temp/'index.json')
+        key = f'osx-{arch}-tar' if IS_MAC else f'linux-{arch}'
+        releases = json.loads((temp/'index.json').read_text(encoding='utf-8'))
+        release = next(r for r in releases if r.get('lts') and key in r.get('files', ()))
+        name = f"node-{release['version']}-{system}-{arch}"
+        print(f"[Node.js] Загрузка {release['version']} (LTS «{release['lts']}»)…", flush=True)
+        download(f"{NODE_DIST}/{release['version']}/SHASUMS256.txt", temp/'sums.txt')
+        download(f"{NODE_DIST}/{release['version']}/{name}.tar.gz", temp/'node.tar.gz')
+        expected = re.search(r'^([0-9a-f]{64})\s+' + re.escape(name + '.tar.gz') + '$',
+                             (temp/'sums.txt').read_text(encoding='utf-8'), re.M)
+        digest = hashlib.sha256((temp/'node.tar.gz').read_bytes()).hexdigest()
+        if not expected or expected.group(1) != digest:
+            raise OSError('контрольная сумма Node.js не совпала; файл отброшен')
+        with tarfile.open(temp/'node.tar.gz') as archive:
+            if hasattr(tarfile, 'data_filter'):
+                archive.extractall(temp, filter='data')
+            else:
+                archive.extractall(temp)
+        shutil.rmtree(TOOLS_DIR/'node', ignore_errors=True)
+        (temp/name).rename(TOOLS_DIR/'node')
+    add_local_tools_to_path()
+    print(f"[Node.js] Установлен в {TOOLS_DIR/'node'}", flush=True)
+
+
+def install_ngrok_local():
+    """Official ngrok agent into tools/ngrok."""
+    arch = {'x64': 'amd64', 'arm64': 'arm64', 'arm': 'arm', '386': '386'}.get(machine())
+    if not arch or (IS_MAC and arch not in ('amd64', 'arm64')):
+        raise OSError(f'нет официальной сборки ngrok для архитектуры {machine()}')
+    url = NGROK_DIST.format(system='darwin' if IS_MAC else 'linux', arch=arch, ext='zip' if IS_MAC else 'tgz')
+    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    print('[ngrok] Загрузка официальной сборки…', flush=True)
+    with tempfile.TemporaryDirectory(dir=TOOLS_DIR) as temp:
+        archive_path, binary = Path(temp)/'ngrok.archive', Path(temp)/'ngrok'
+        download(url, archive_path)
+        if IS_MAC:
+            with zipfile.ZipFile(archive_path) as archive:
+                binary.write_bytes(archive.read('ngrok'))
+        else:
+            with tarfile.open(archive_path) as archive:
+                member = archive.extractfile('ngrok')
+                if member is None:
+                    raise OSError('в архиве ngrok нет исполняемого файла')
+                binary.write_bytes(member.read())
+        binary.chmod(0o755)
+        os.replace(binary, TOOLS_DIR/'ngrok')
+    add_local_tools_to_path()
+    print(f"[ngrok] Установлен в {TOOLS_DIR/'ngrok'}", flush=True)
+
+
+def offer(question, installer, manual):
+    if not confirm(question):
+        return
+    try:
+        installer()
+    except (OSError, ValueError, StopIteration, tarfile.TarError, zipfile.BadZipFile, subprocess.SubprocessError) as exc:
+        print(f'Не удалось установить автоматически: {exc}. Установите вручную: {manual}', flush=True)
+
+
 def ensure_all(interactive=False):
     checks = inspect_all()
     display(checks)
     if all(item.ok for item in checks):
         return True
     if not interactive:
-        print('Запустите install_dependencies.bat, чтобы установить недостающие компоненты.', flush=True)
+        print(f"Запустите {script('install_dependencies')}, чтобы установить недостающие компоненты.", flush=True)
         return False
     # Node includes npm; offer one installer, not two conflicting installations.
     if not checks[1].ok or not checks[2].ok:
-        if confirm('Установить или обновить Node.js LTS вместе с npm через winget?'):
-            install_winget('OpenJS.NodeJS.LTS')
+        if IS_WINDOWS:
+            if confirm('Установить или обновить Node.js LTS вместе с npm через winget?'):
+                install_winget('OpenJS.NodeJS.LTS')
+        else:
+            offer('Скачать официальный Node.js LTS вместе с npm в папку tools/ (без sudo)?',
+                  install_node_local, 'https://nodejs.org/en/download')
     if not checks[3].ok:
-        if confirm('Установить или обновить ngrok через winget?'):
-            install_winget('Ngrok.Ngrok')
-            update_ngrok_after_winget()
+        if IS_WINDOWS:
+            if confirm('Установить или обновить ngrok через winget?'):
+                install_winget('Ngrok.Ngrok')
+                update_ngrok_after_winget()
+        else:
+            offer('Скачать официальный ngrok в папку tools/ (без sudo)?',
+                  install_ngrok_local, 'https://ngrok.com/download')
     node = inspect_runtime('Node', executable('node'), (22, 0, 0))
     npm = inspect_runtime('npm', executable('npm'), (9, 0, 0))
     if node.ok and npm.ok and not inspect_packages().ok:
         if confirm('Установить или переустановить локальные npm-зависимости по lock-файлу (npm ci --ignore-scripts)?'):
-            subprocess.run([executable('npm'), 'ci', '--ignore-scripts', '--no-fund'], cwd=str(ROOT))
+            subprocess.run([executable('npm'), 'ci', '--ignore-scripts', '--no-fund', '--no-audit'], cwd=str(ROOT))
     checks = inspect_all()
     display(checks)
     if not all(item.ok for item in checks):
@@ -298,7 +412,7 @@ def save_receipt():
 
 def require_receipt():
     if not read_receipt():
-        raise SystemExit('Нет сохранённой успешной проверки зависимостей. Один раз запустите install_dependencies.bat.')
+        raise SystemExit(f"Нет сохранённой успешной проверки зависимостей. Один раз запустите {script('install_dependencies')}.")
 
 
 def clear_receipt():
